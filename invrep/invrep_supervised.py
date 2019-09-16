@@ -2,7 +2,7 @@ import numpy as np
 import pickle
 import datetime
 import os
-from utils import get_accuracy, get_f1
+from invrep_utils import get_accuracy, get_f1, predict_with_batches
 import kl_tools
 import tensorflow as tf
 config = tf.ConfigProto()
@@ -73,9 +73,40 @@ class Model:
         self.epoch_history.append(c)
         if verbose==True:
             print(
-                "   Train:invrep\tl: {:0.4f}\tx: {:0.4f}\ty: {:0.4f}\tkl: {:0.4f}"
+                "Train:invrep\tl: {:0.4f}\tx: {:0.4f}\ty: {:0.4f}\tkl: {:0.4f}"
                 .format(c["total_loss"],-c["x_likelyhood"], -c["y_likelyhood"], c["kl_div"]))
         return losses
+
+    def evaluate(self, batch_generator, steps=-1, label="eval", verbose=True):
+        """
+        Evaluate invrep model's x->y prediction.
+
+        Parameters
+        ----------
+        batch_generator : Data source: returns input, label, confounds with minibatches
+        steps : int, optional
+            Number of calls to the generator, by default -1 (untill generator finishes)
+        verbose : bool, optional
+            prints accuracy and f1 scores, by default True
+        Returns accuracy and f1 scores
+        """
+        metrics = []
+        for i, (batch_x, batch_y, _) in \
+            enumerate(batch_generator):
+            acc_xy, f1_xy = self.session.run(
+                (self.accuracy_xy, self.f1_xy), 
+                feed_dict={self.x_in:batch_x, self.y_in:batch_y})
+            metrics.append([acc_xy, f1_xy])
+            if i == steps-1:
+                break
+        c = {}
+        c[f"xy_acc_{label}"], c[f"xy_f1_{label}"] = np.mean(metrics, axis=0)
+        self.epoch_history[-1].update(c)
+        if verbose==True:
+            print(
+                "  {}\txy: {:0.2f}% {:0.4f}"
+                .format(label, c[f"xy_acc_{label}"], c[f"xy_f1_{label}"]))
+        return c
 
     def train_adversarial(self, batch_generator, epochs=1, steps=-1, verbose=True):
         """
@@ -120,11 +151,12 @@ class Model:
         self.epoch_history[-1].setdefault("adv", dict()).update(c)
         if verbose==True:
             print(
-                "   Eval :advers\tzc: {:0.2f}% {:0.4f}\tzy: {:0.2f}% {:0.4f}"
+                "   advers:Train\tzc: {:0.2f}% {:0.4f}\tzy: {:0.2f}% {:0.4f}"
                 .format(c["zc_acc"][-1], c["zc_f1"][-1], c["zy_acc"][-1], c["zy_f1"][-1]))
         return c
     
-    def eval_adversarial(self,batch_generator, steps=-1, verbose=True):
+    def eval_adversarial(self,batch_generator, steps=-1, 
+        label="eval", skip_c=False, verbose=True):
         """
         Evaluate discriminator networks for evaluating latent variable:
             evaluates scores for z->c and z->y prediction
@@ -133,65 +165,43 @@ class Model:
         batch_generator : Data source: returns input, label, confounds with minibatches
         steps : int, optional
             Number of calls to the generator, by default -1 (untill generator finishes)
+        label: namespace in dictionary `epoch_history`
         verbose : bool, optional
             prints accuracy and f1 scores, by default True
         Returns accuracy and f1 scores
         """
-        c = {}
         metrics = []
         for i, (batch_x, batch_y, batch_c) in \
-            enumerate(batch_generator):
-            batch_z = self.session.run(self.z, 
-                feed_dict={self.x_in:batch_x})
-            acc_zc, f1_zc, acc_zy, f1_zy = self.session.run(
-                (self.accuracy_zc, self.f1_zc, self.accuracy_zy, self.f1_zy ), 
-                feed_dict={self.z_in:batch_z, self.y_in:batch_y, self.c_in:batch_c})
-            metrics.append([acc_zc, f1_zc, acc_zy, f1_zy])
-            if i == steps-1:
-                break
-        c["zc_acc_eval"], c["zc_f1_eval"], \
-            c["zy_acc_eval"],c["zy_f1_eval"] = np.mean(metrics, axis=0)
-        
-        self.epoch_history[-1].setdefault("adv", dict()).update(c)
-        if verbose==True:
-            print(
-                "   Eval :advers\tzc: {:0.2f}% {:0.4f}\tzy: {:0.2f}% {:0.4f}"
-                .format(c["zc_acc_eval"], c["zc_f1_eval"], c["zy_acc_eval"], c["zy_f1_eval"]))
-        return c
-    
-    def eval_on_validation(self,batch_generator, steps=-1, verbose=True):
-        """
-        Evaluate discriminator networks for evaluating latent variable:
-            evaluates scores for z->y prediction (z->c is not available in this case)
-        Parameters
-        ----------
-        batch_generator : Data source: returns input, label, confounds with minibatches
-        steps : int, optional
-            Number of calls to the generator, by default -1 (untill generator finishes)
-        verbose : bool, optional
-            prints accuracy and f1 scores, by default True
-        Returns accuracy and f1 scores
-        """
-        c = {}
-        metrics = []
-        for i, (batch_x, batch_y, _) in \
             enumerate(batch_generator):
             batch_z = self.session.run(self.z, 
                 feed_dict={self.x_in:batch_x})
             acc_zy, f1_zy = self.session.run(
                 (self.accuracy_zy, self.f1_zy ), 
                 feed_dict={self.z_in:batch_z, self.y_in:batch_y})
-            metrics.append([acc_zy, f1_zy])
+            acc_zc, f1_zc = np.nan, np.nan
+            if skip_c is False:
+                acc_zc, f1_zc = self.session.run((self.accuracy_zc, self.f1_zc),
+                feed_dict={self.z_in:batch_z, self.y_in:batch_y, self.c_in:batch_c}
+                )
+            metrics.append([acc_zc, f1_zc, acc_zy, f1_zy])
             if i == steps-1:
                 break
-        c["zy_acc_eval_val"], c["zy_f1_eval_val"] = np.mean(metrics,axis=0)
+        c = {}        
+        c[f"zc_acc_{label}"], c[f"zc_f1_{label}"], \
+            c[f"zy_acc_{label}"],c[f"zy_f1_{label}"] = np.mean(metrics, axis=0)
+        
         self.epoch_history[-1].setdefault("adv", dict()).update(c)
         if verbose==True:
             print(
-                "   Eval :advers\t\t\t\tzy: {:0.2f}% {:0.4f}"
-                .format(c["zy_acc_eval_val"], c["zy_f1_eval_val"]))
+                "   advers:{}\tzc: {:0.2f}% {:0.4f}\tzy: {:0.2f}% {:0.4f}"
+                .format(label, c[f"zc_acc_{label}"], c[f"zc_f1_{label}"], 
+                        c[f"zy_acc_{label}"], c[f"zy_f1_{label}"]))
         return c
     
+    
+    def predict(self, input, input_values, output, batch_size=100):
+        return predict_with_batches(self.session, 
+            {input: input_values}, output, batch_size=batch_size)
 
     def _build_graph(self):
         """
@@ -209,6 +219,8 @@ class Model:
                 self.z, self.c_in, self.input_shape)
             self.y_hat = self._generative_classifier(
                 self.z, self.n_labels)
+            self.y_hat_soft = tf.nn.softmax(self.y_hat)
+            
 
     def _build_adversarial(self):
         """
@@ -216,16 +228,20 @@ class Model:
         """
         with tf.variable_scope("adversarial"):
             self.z_in = tf.placeholder(tf.float32, shape=[None, self.latent_dim], name="z_in")
+            # self.z_in = self.z
             # adversarial z->c
             self.adv_zc = self._ffnetwork(
                 self.z_in, self.n_confounds, "adv_z_to_c",
                 hidden_layers=0, hidden_units=100, 
                 final_activation=None)
+            self.adv_zc_soft = tf.nn.softmax(self.adv_zc)
             # adversarial z->y
             self.adv_zy = self._ffnetwork(
                 self.z_in, self.n_labels, "adv_z_to_y",
                 hidden_layers=0, hidden_units=100, 
                 final_activation=None)
+            self.adv_zy_soft = tf.nn.softmax(self.adv_zy)
+
 
     def _build_loss(self):
         """
@@ -249,6 +265,9 @@ class Model:
             self.total_loss = -ELBO  # should be minimized
 
             self.train_op = tf.train.AdamOptimizer(self.learning_rate).minimize(self.total_loss)
+
+            self.accuracy_xy = get_accuracy(self.y_in, self.y_hat)    
+            self.f1_xy = get_f1(self.y_in, self.y_hat) 
 
     def _build_avd_loss(self):
         """

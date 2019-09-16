@@ -5,65 +5,36 @@ from sklearn.utils import class_weight
 import os
 import tensorflow as tf
 
+import sys; sys.path.append("..")
 from utils import one_hot, batch_generator
+import data_process_tools
 
-data_file = "data.train-val.76patients.2000+1000samples.800points.19-09-04.16:54:30.pkl"
-with open(os.path.join("samples", data_file), "rb") as f:
-    beats_part1, labels_part1, beats_part2, labels_part2 = pickle.load(f)
-patients_in_train = 57
+print("Reading data...")
+data_file = "../ecg_data_2/samples/data.train-val.163patients.156544+78278samples.800points.19-09-11.18:52:43.pkl"
+with open(data_file, "rb") as f:
+    train, qval, val = data_process_tools.label(
+        data_process_tools.split(pickle.load(f), 
+        train_portion=0.6, val_portion=0.4, seed=202))
 
-train_beats = beats_part1[:patients_in_train].reshape(-1, 800, 6)
-train_labels = labels_part1[:patients_in_train].reshape(-1)
+# select channels
+for obj in (train, qval, val):
+    obj.x = obj.x[:, :, 2:]
 
-qval_beats = beats_part2[:patients_in_train].reshape(-1, 800, 6)
-qval_labels = labels_part2[:patients_in_train].reshape(-1)
+# set one-hot inputs
+for obj in (train, qval, val):
+    for attr in ("y", "p"):
+        setattr(obj, attr, one_hot(getattr(obj, attr)))
 
-val_beats = beats_part1[patients_in_train:].reshape(-1, 800, 6)
-val_labels = labels_part1[patients_in_train:].reshape(-1)
-
-# substruct mean
-for x in [train_beats, qval_beats, val_beats]:
-    x[:] = x - x.mean(axis=1, keepdims=True)
-
-patients = (set(x["patient"] for x in train_labels) | 
-            set(x["patient"] for x in qval_labels) |
-            set(x["patient"] for x in val_labels))
-P = {p:i for i,p in enumerate(patients)}
-print(len(P) , "patients")
-
-def label_processor_to_patient(label):
-    return P[label["patient"]]
-
-def label_processor_to_group(label):
-    G = {"ctrls":0, "t1posajneg":1, "t1negajpos":2}
-    return G[label["group"]]
-
-def label_processor_to_label(label):
-    G = {"ctrls":0, "t1posajneg":1, "t1negajpos":1}
-    return G[label["group"]]
-
-
-train_c = one_hot(np.array([label_processor_to_patient(x) for x in train_labels]))
-train_y = one_hot(np.array([label_processor_to_label(x) for x in train_labels]))
-train_g = (np.array([label_processor_to_group(x) for x in train_labels]))
-
-qval_c = one_hot(np.array([label_processor_to_patient(x) for x in qval_labels]))
-qval_y = one_hot(np.array([label_processor_to_label(x) for x in qval_labels]))
-qval_g = (np.array([label_processor_to_group(x) for x in qval_labels]))
-
-val_c = one_hot(np.array([label_processor_to_patient(x) for x in val_labels]))
-val_y = one_hot(np.array([label_processor_to_label(x) for x in val_labels]))
-val_g = (np.array([label_processor_to_group(x) for x in val_labels]))
-
-class_weights=class_weight.compute_class_weight("balanced", [0,1], train_y.argmax(axis=-1))
+class_weights=class_weight.compute_class_weight("balanced", [0,1], train.y.argmax(axis=-1))
 print("Class weights:", class_weights)
 
-train_batches = batch_generator(train_beats, train_y, train_c, batch_size=100, infinite=True)
-qval_batches = batch_generator(qval_beats, qval_y, qval_c, batch_size=100, infinite=True)
-val_batches = batch_generator(val_beats, val_y, val_c, batch_size=100, infinite=True)
+train.batches = batch_generator(train.x, train.y, train.p, batch_size=100, infinite=True)
+qval.batches = batch_generator(qval.x, qval.y, qval.p, batch_size=100, infinite=True)
+val.batches = batch_generator(val.x, val.y, val.p, batch_size=100, infinite=True)
 
 
-drop_rate = 0.15
+print("Building model...")
+drop_rate = 0.1
 
 class Model_invrep(invrep_supervised.Model):
     @staticmethod
@@ -101,36 +72,40 @@ class Model_invrep(invrep_supervised.Model):
             h = z_in
             h = tf.layers.dense(h, 100, activation="relu")
             h = tf.layers.dropout(h, drop_rate)
-            
+            h = tf.layers.dense(h, 100, activation="relu")
+            h = tf.layers.dropout(h, drop_rate)
             y_hat = tf.layers.dense(h, output_shape, activation="linear")
         return y_hat
 
 
-epoches = 13
+epoches = 35
+adam_lr = 0.001
 verbose = True
 
 def search_for(lambda_param, beta_param):
     tf.reset_default_graph()
-    model = Model_invrep(input_shape=(800,6), latent_dim=100, 
-                n_labels=train_y.shape[1], n_confounds=train_c.shape[1],
+    model = Model_invrep(input_shape=train.x.shape[-2:], latent_dim=100, 
+                n_labels=train.y.shape[1], n_confounds=train.p.shape[1],
                 class_weights=class_weights, drop_rate=drop_rate,
-                lambda_param=lambda_param, beta_param=beta_param)
+                lambda_param=lambda_param, beta_param=beta_param,
+                learning_rate=adam_lr)
     for epoch in range(epoches):
-        if epoch == epoches-1:
-            eval_steps = 500
-        else:
-            eval_steps = 1000
+        eval_steps = 200
 
-        model.train_invrep(train_batches, steps=200, verbose=verbose)
-        model.train_adversarial(train_batches, epochs=10, steps=100, verbose=verbose)
-        model.eval_adversarial(qval_batches, steps=eval_steps, verbose=verbose)
-        model.eval_on_validation(val_batches, steps=eval_steps)
-    model.save("./runs", prefix="run_2")
+        model.train_invrep(train.batches, steps=150, verbose=verbose)
+        model.evaluate(qval.batches, steps=eval_steps, label="qeval", verbose=verbose)
+        model.evaluate(val.batches, steps=eval_steps, label="eval", verbose=verbose)
+    
+        # model.train_adversarial(train_batches, epochs=5, steps=50, verbose=verbose)
+        # model.eval_adversarial(qval_batches, steps=eval_steps, label="qeval", verbose=verbose)
+        # model.eval_adversarial(val_batches, steps=eval_steps, label="eval", skip_c=True, verbose=verbose)
+    
+    model.save("./runs", prefix="run_multiple")
 
+# search_for(0.003, 0.003)
+# exit(0)
 
-search_for(0.0001, 0.0001)
-
-exit(0)
+print("Starting gridsearch...")
 
 lambdas = list(np.logspace(1, -5, 15).round(8)) + [0, 100]
 betas = list(np.logspace(1, -5, 15).round(8)) + [0, 100]
@@ -141,5 +116,6 @@ for l in lambdas:
 np.random.seed(42)
 np.random.shuffle(values)
 
-for x in values:
-    search_for(**x)
+for _ in range(10):
+    for x in values:
+        search_for(**x)
