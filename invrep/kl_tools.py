@@ -82,9 +82,14 @@ def kl_conditional_and_marg(mu,sigma,dim_z):
 
     B = tf.to_float(tf.shape(mu)[0])
     all_pairs_GKL = all_pairs_gaussian_kl(mu,sigma,dim_z,True)
-    return (1.0 / B) * tf.reduce_mean(\
-        (tf.reduce_sum(all_pairs_GKL,1) + (B - 1) * tf.transpose(gaussian_ent)) - tf.log( B )\
-    ) #- log(B)
+    
+    return tf.reduce_mean(all_pairs_GKL)
+    # same as return tf.reduce_mean((1/B) * tf.reduce_sum(all_pairs_GKL,1))
+    
+    # Wrong !!!!!
+    # return (1.0 / B) * tf.reduce_mean(\
+    #     (tf.reduce_sum(all_pairs_GKL,1) + (B - 1) * tf.transpose(gaussian_ent)) - tf.log( B )\
+    # ) #- log(B)
 #(tf.reduce_sum(all_pairs_GKL,1) + (B - 1)*gaussian_ent)\
 
 
