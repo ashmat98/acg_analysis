@@ -4,17 +4,23 @@ import wfdb
 import os
 
 
-def read_as_beats(directory, fixed_len=800):
+def read_as_beats(directory, fixed_len=800, start_hour=1, end_hour=24):
     q, patient_name = os.path.split(directory)
     _, group_name = os.path.split(q)
     
-    data, samples = read_patient(directory)
-    data = data[..., 2:]
+    data, samples = read_patient(directory, start_hour=1, end_hour=24)
+#     data = data[..., 2:]
     samples["END"] = (samples.Time + samples.QT + 100).astype(int)
     samples["START"] = (samples.Time - 100).astype(int)
     beats, labels = [], []
     for row in samples.itertuples():
+        if row.START <0:
+            continue
         beat = data[row.START:row.END]
+        
+        if np.any(np.isnan(beat)) == True:
+            continue
+
         anot_dict = dict(row._asdict())
         anot_dict.pop("START")
         anot_dict.pop("END")
@@ -41,7 +47,26 @@ def create_header(record, header):
         with open(new_header_fpath, "w") as new_header:
             new_header.write(header.replace(header_default_name, name))
 
-def read_csv(patient, drop_na=True):
+def read_csv(patient, start_hour=1, end_hour=24, drop_na=True):
+    """
+    Reads and concatenates csv files. 
+    CSV file nams have form ****QT#.csv
+
+    Parameters
+    ----------
+    patient : std, folder containing csv files.
+    start_hour : int, starting hour of the record, by default 1
+        this value will be substructed from the Time values in the frame 
+        shuch that Time column will start from zero (nearly).
+    end_hour : int, ending hour of the record, by default 24
+        after substruction all values in the Time column will be 
+        less then end_hour * 3600000.
+    drop_na : bool, optional, Drom rows containing NaNs, by default True.
+    
+    Returns
+    -------
+    Pandas Dataframe.
+    """
     frames = []
     for x in sorted(os.listdir(patient)):
         if os.path.splitext(x)[1] == ".csv" and "QT" in x:
@@ -52,12 +77,34 @@ def read_csv(patient, drop_na=True):
     
     frame = pd.concat(frames, axis=0, ignore_index=True)
     if drop_na is True:
-        nacols = frame.isna().all()
-        frame = frame.drop(columns=nacols[nacols==True].index).dropna()
+        # nacols = frame.isna().all()
+        # frame = frame.drop(columns=nacols[nacols==True].index).dropna()
+        frame = frame[(frame.Annotation == 0) & (frame.QT.isna() == False)]
         frame = frame.reset_index(drop=True)
+    
+    start_hour = start_hour - 1
+    ids = (start_hour*3600000<=frame.Time) & (frame.Time<end_hour*3600000)
+    frame = frame[ids]
+    frame.Time -= start_hour * 3600000
+    frame = frame.reset_index(drop=True)
+
     return frame
 
-def read_patient(directory, header=None, rate=1000, channels=None, start_hour=0, end_hour=24, 
+def get_hour_from_filename(name):
+    """
+    Filename has form "Hour<number>RawData"
+    e.g Hour10RawData.bin
+    if got name of different form, returns None.
+    """
+     # name e.g. "Hour10RawData"
+    try:
+        hour = int(name.split("Hour")[1].split("RawData")[0])
+    except Exception as e:
+        print(e, name)
+        return None
+    return hour
+
+def read_patient(directory, header=None, rate=1000, channels=None, start_hour=1, end_hour=24, 
                  save_gzip=None, dtype=32, drop_na=True):
     """ 
     Reads patients ECG data from the binnary files.
@@ -70,7 +117,7 @@ def read_patient(directory, header=None, rate=1000, channels=None, start_hour=0,
         channels (list of int or int optional): returns specific channels. 
             Give name or index of the channel. Defaults to None, 
             i.e. returns al channels.
-        start_hour (int, optional): start hour of the recording, 1..24. Defaults to 0.
+        start_hour (int, optional): start hour of the recording, 1..24. Defaults to 1.
         end_hour (int, optional): end hour inclusive, 1..24. Defaults to 24.
         save_gzip (str, optional): save data as gzip file int the specified directory,
             Defaults to None, not to save
@@ -84,24 +131,19 @@ def read_patient(directory, header=None, rate=1000, channels=None, start_hour=0,
     for file in os.listdir(directory):
         name, ext = os.path.splitext(file)
         if ext == ".bin":
-            bin_files.append(name)
-
-
-    data = []
-    for name in bin_files:
-        
-        # name e.g. "Hour10RawData"
-        hour = 0
-        if len(bin_files) > 1:
-            try:
-                hour = int(name.split("Hour")[1].split("RawData")[0])
-            except Exception as e:
-                print(e, name)
+            hour = get_hour_from_filename(name)
+            if hour is None:
                 continue
-    
             if not start_hour <= hour <= end_hour:
                 continue
-        
+            bin_files.append((hour, name))
+
+    bin_files = sorted(bin_files, key=lambda x: x[0])
+    
+    # allocate 
+    data = np.zeros((len(bin_files)*3600*rate, 8), dtype="float" + str(dtype)); data+=1
+    free_point = 0
+    for hour, name in bin_files:      
         if header is not None:
             # create header file
             create_header(os.path.join(directory, name), header)
@@ -111,17 +153,17 @@ def read_patient(directory, header=None, rate=1000, channels=None, start_hour=0,
                     return_res=dtype)
         values = rec.p_signal[::1000//rate]
         
-        data.append((hour, values))
+        data[free_point:][:values.shape[0], :values.shape[1]] = values
+        free_point += values.shape[0]
     
-    data = sorted(data, key=lambda x: x[0])
     
-    all_values = np.concatenate(
-        [values for hour, values in data], axis=0)
+    all_values = data[:free_point]
+
+    hours = [hour for hour, name in bin_files]
     if save_gzip is not None:
         np.savez_compressed(save_gzip, all_values)
         
     # reading CSV files
-    frame = read_csv(directory, drop_na)
-
+    frame = read_csv(directory, min(hours), max(hours), drop_na)
     return all_values, frame
 
