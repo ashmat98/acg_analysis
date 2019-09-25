@@ -8,51 +8,44 @@ import tensorflow as tf
 import sys; sys.path.append("..")
 from utils import one_hot, batch_generator
 import data_process_tools
+from data_process_tools import Data
 
-print("Reading data...")
-data_file = "../ecg_data_2/samples/data.train-val.163patients.156544+78278samples.800points.19-09-11.18:52:43.pkl"
-with open(data_file, "rb") as f:
-    train, qval, val = data_process_tools.label(
-        data_process_tools.split(pickle.load(f), 
-        train_portion=0.06, val_portion=0.94, seed=202))
+print("Generating data...")
+x = np.random.rand(30000, 2) *2 - 1
+r = (x[:, 0]**2 + x[:, 1]**2)
+x = x[r<1]
 
+y = one_hot((x[:, 0] >0).astype("int"))
+c = x[:, 1, None]
 
-# select channels
-for obj in (train, qval, val):
-    obj.x = obj.x[:, :600, 2:]
-
-print(np.unique(train.p).shape, train.x.shape, val.x.shape)
-
-
-# set one-hot inputs
-for obj in (train, qval, val):
-    for attr in ("y", "p"):
-        setattr(obj, attr, one_hot(getattr(obj, attr)))
-
-class_weights=class_weight.compute_class_weight("balanced", [0,1], train.y.argmax(axis=-1))
+class_weights=[1., 1.]
 print("Class weights:", class_weights)
 
-train.batches = batch_generator(train.x, train.y, train.p, batch_size=100, infinite=True)
-qval.batches = batch_generator(qval.x, qval.y, qval.p, batch_size=100, infinite=True)
-val.batches = batch_generator(val.x, val.y, val.p, batch_size=100, infinite=True)
+ids = np.prod(x, axis=1)>0
+train = Data(x=x[ids], y=y[ids], c=c[ids])
+ids = np.prod(x, axis=1)<0
+val = Data(x=x[ids], y=y[ids], c=c[ids])
+
+train.batches = batch_generator(train.x, train.y, train.c, batch_size=100, infinite=True)
+val.batches = batch_generator(val.x, val.y, val.c, batch_size=100, infinite=True)
 
 
 print("Building model...")
 drop_rate = 0.1
-sigma=0.001
-
+sigma = 0.002
 class Model_invrep(invrep_supervised.Model):
     @staticmethod
     def _gaussian_encoder(x_in, latent_dim):
+        activation = tf.nn.tanh
         h = tf.layers.flatten(x_in)
 
-        h = tf.layers.dense(h, 200, activation=tf.nn.relu)
+        h = tf.layers.dense(h, 10, activation=activation)
         h = tf.layers.dropout(h, drop_rate)
-        h = tf.layers.dense(h, 200, activation=tf.nn.relu)
+        h = tf.layers.dense(h, 10, activation=activation)
         h = tf.layers.dropout(h, drop_rate)
-        h = tf.layers.dense(h, 200, activation=tf.nn.relu)
+        h = tf.layers.dense(h, 10, activation=activation)
         h = tf.layers.dropout(h, drop_rate)
-        h = tf.layers.dense(h, 200, activation=tf.nn.relu)
+        h = tf.layers.dense(h, 10, activation=activation)
         h = tf.layers.dropout(h, drop_rate)
         mu = tf.layers.dense(h, latent_dim, activation=None)
         sigma = tf.layers.dense(h, latent_dim, activation=tf.nn.softplus)
@@ -64,69 +57,69 @@ class Model_invrep(invrep_supervised.Model):
     @staticmethod
     def _generative_decoder(z_in, c_in, output_shape):
         with tf.name_scope("generative_decoder"):
+            activation = tf.nn.tanh
+
             h = tf.concat(values=[z_in,c_in], axis=1)
             
-            h = tf.layers.dense(h, 200, activation=tf.nn.relu)
+            h = tf.layers.dense(h, 10, activation=activation)
             h = tf.layers.dropout(h, drop_rate)
-            h = tf.layers.dense(h, 200, activation=tf.nn.relu)
+            h = tf.layers.dense(h, 10, activation=activation)
             h = tf.layers.dropout(h, drop_rate)
-            h = tf.layers.dense(h, 200, activation=tf.nn.relu)
+            h = tf.layers.dense(h, 10, activation=activation)
             h = tf.layers.dropout(h, drop_rate)
-            h = tf.layers.dense(h, 200, activation=tf.nn.relu)
+            h = tf.layers.dense(h, 10, activation=activation)
             h = tf.layers.dropout(h, drop_rate)
 
-            x_decoded = tf.layers.dense(h, output_shape[0]*output_shape[1], activation=None)
-            x_decoded = tf.reshape(x_decoded, (-1,) + output_shape)
+            x_decoded = tf.layers.dense(h, output_shape[0], activation=None)
+#             x_decoded = tf.reshape(x_decoded, (-1, 800, 6))
         return x_decoded
 
     @staticmethod
     def _generative_classifier(z_in, output_shape):
         with tf.name_scope("generative_classifier"):
+            activation = tf.nn.tanh
+
             h = z_in
-            h = tf.layers.dense(h, 100, activation="relu")
+            h = tf.layers.dense(h, 5, activation=activation)
             h = tf.layers.dropout(h, drop_rate)
-            h = tf.layers.dense(h, 100, activation="relu")
+            h = tf.layers.dense(h, 5, activation=activation)
             h = tf.layers.dropout(h, drop_rate)
-            h = tf.layers.dense(h, 100, activation="relu")
+            h = tf.layers.dense(h, 5, activation=activation)
             h = tf.layers.dropout(h, drop_rate)
-            
             y_hat = tf.layers.dense(h, output_shape, activation="linear")
         return y_hat
-    
     @staticmethod
     def reconstuction_likelihood(true_tensor, predicted_tensor):
         """
         Reconstruction likelihood for x/input reconstruction.
         """
-        n_output = 600*6
-        return -(n_output/(2*sigma**2))*tf.losses.mean_squared_error(
+        return -(2/(2*sigma**2))*tf.losses.mean_squared_error(
                 labels=true_tensor, 
                 predictions=predicted_tensor )
 
-
-epoches = 300
-adam_lr = 0.001
+epoches = 350
+adam_lr = 0.0005
 verbose = True
 
 def search_for(lambda_param, beta_param):
     tf.reset_default_graph()
-    model = Model_invrep(input_shape=train.x.shape[-2:], latent_dim=100, 
-                n_labels=train.y.shape[1], n_confounds=train.p.shape[1],
+    model = Model_invrep(input_shape=train.x.shape[-1:], latent_dim=100, 
+                n_labels=train.y.shape[1], n_confounds=train.c.shape[1],
                 class_weights=class_weights, drop_rate=drop_rate,
                 lambda_param=lambda_param, beta_param=beta_param,
                 learning_rate=adam_lr)
     for epoch in range(epoches):
         eval_steps = 200
 
-        model.train_invrep(train.batches, steps=15, verbose=verbose)
-        model.evaluate(qval.batches, steps=eval_steps, label="qeval", verbose=verbose)
+        model.train_invrep(train.batches, steps=10, verbose=verbose)
+        model.evaluate(train.batches, steps=eval_steps, label="qeval", verbose=verbose)
         model.evaluate(val.batches, steps=eval_steps, label="eval", verbose=verbose)
     
         # model.train_adversarial(train_batches, epochs=5, steps=50, verbose=verbose)
         # model.eval_adversarial(qval_batches, steps=eval_steps, label="qeval", verbose=verbose)
         # model.eval_adversarial(val_batches, steps=eval_steps, label="eval", skip_c=True, verbose=verbose)
     
-    model.save("./runs", prefix="run_multiple-less-patients-2")
+    model.save("./runs", prefix="run_synthetic-sigma-2")
 
 # search_for(0.003, 0.003)
 # exit(0)
@@ -134,15 +127,15 @@ def search_for(lambda_param, beta_param):
 print("Starting gridsearch...")
 
 lambdas = list(np.logspace(1, -6, 15).round(8)) + [0, 100]
-betas = list(np.logspace(0, -6, 7).round(8)) + [0, 100]
+betas = list(np.logspace(1, -6, 15).round(8)) + [0, 100]
 values = []
 for l in lambdas:
     for b in betas:
         values.append({"lambda_param":l, "beta_param":b})
-# np.random.seed(43)
-# np.random.shuffle(values)
 
-for _ in range(50):
+# np.random.seed(42)
+
+for _ in range(10):
     np.random.shuffle(values)
     for x in values:
         search_for(**x)
